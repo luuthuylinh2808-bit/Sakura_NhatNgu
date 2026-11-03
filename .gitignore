@@ -1,0 +1,29 @@
+# File cấu hình nhạy cảm - KHÔNG đẩy lên GitHub
+/config/database.php
+.env
+.env.local
+
+# Log và file tạm
+webhook_log.txt
+*.log
+*.tmp
+error_log
+
+# File backup database
+*.sql
+*.sql.gz
+
+# Cấu hình webhook (secret key)
+config/sepay_config.php
+config/casso_config.php
+
+# Hệ điều hành / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Node/NPM (nếu có)
+node_modules/
+package-lock.json
