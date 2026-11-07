@@ -1,224 +1,861 @@
 <?php
-// Tính toán dữ liệu tiến độ thực tế
-$percent_lesson = 0; $percent_vocab = 0; $percent_grammar = 0; $total_progress = 0;
+if (!isset($conn)) {
+    require_once __DIR__ . '/../config/database.php';
+}
+
+// Đảm bảo cột premium_expiry tồn tại trong bảng users
+$check_col = $conn->query("SHOW COLUMNS FROM users LIKE 'premium_expiry'");
+if ($check_col && $check_col->num_rows == 0) {
+    $conn->query("ALTER TABLE users ADD COLUMN premium_expiry DATETIME DEFAULT NULL");
+}
+
+$is_logged_in = isset($_SESSION['user_id']);
+$is_n3_unlocked = false;
+$is_lifetime = false;
+$expiry_display = '';
 $fav_lessons = [];
 
-if (isset($_SESSION['user_id'])) {
-    require_once 'config/database.php';
-    $uid = $_SESSION['user_id'];
-   
-    // 1. Lấy dữ liệu tiến độ
-    $total_lessons = $conn->query("SELECT COUNT(*) as c FROM lessons")->fetch_assoc()['c'];
-    $total_vocab = $conn->query("SELECT COUNT(*) as c FROM vocabulary")->fetch_assoc()['c'];
-    $total_grammar = $conn->query("SELECT COUNT(*) as c FROM grammars")->fetch_assoc()['c'];
-   
-    $learned_lessons = $conn->query("SELECT COUNT(DISTINCT id_lesson) as c FROM user_progress WHERE id = $uid")->fetch_assoc()['c'];
-    $learned_vocab = $conn->query("SELECT COUNT(*) as c FROM vocabulary WHERE id_lesson IN (SELECT id_lesson FROM user_progress WHERE id = $uid)")->fetch_assoc()['c'];
-    $learned_grammar = $conn->query("SELECT COUNT(*) as c FROM grammars WHERE id_lesson IN (SELECT id_lesson FROM user_progress WHERE id = $uid)")->fetch_assoc()['c'];
+if ($is_logged_in) {
+    $uid = (int)$_SESSION['user_id'];
     
-    $percent_lesson = ($total_lessons > 0) ? round(($learned_lessons / $total_lessons) * 100) : 0;
-    $percent_vocab = ($total_vocab > 0) ? round(($learned_vocab / $total_vocab) * 100) : 0;
-    $percent_grammar = ($total_grammar > 0) ? round(($learned_grammar / $total_grammar) * 100) : 0;
+    // 1. Kiểm tra trạng thái mở khóa N3 & Thời hạn
+    $chk_unlock = $conn->query("SELECT id FROM user_course_unlocks WHERE id_user = $uid AND level = 'N3'");
+    if ($chk_unlock && $chk_unlock->num_rows > 0) {
+        $u_row = $conn->query("SELECT premium_expiry FROM users WHERE id = $uid")->fetch_assoc();
+        
+        if (!empty($u_row['premium_expiry'])) {
+            $exp_time = strtotime($u_row['premium_expiry']);
+            if ($exp_time > time()) {
+                $is_n3_unlocked = true;
+                $expiry_display = date('d/m/Y', $exp_time);
+                if ((int)date('Y', $exp_time) >= 2090) {
+                    $is_lifetime = true;
+                }
+            } else {
+                $conn->query("DELETE FROM user_course_unlocks WHERE id_user = $uid AND level = 'N3'");
+                $is_n3_unlocked = false;
+            }
+        } else {
+            $default_exp = date('Y-m-d H:i:s', strtotime('+30 days'));
+            $conn->query("UPDATE users SET premium_expiry = '$default_exp' WHERE id = $uid");
+            $is_n3_unlocked = true;
+            $expiry_display = date('d/m/Y', strtotime($default_exp));
+        }
+    }
 
-    // Tổng tiến độ
-    $total_items = $total_lessons + $total_vocab + $total_grammar;
-    $learned_items = $learned_lessons + $learned_vocab + $learned_grammar;
-    $total_progress = ($total_items > 0) ? round(($learned_items / $total_items) * 100) : 0;
-
-    // 2. Lấy danh sách Bài học yêu thích
-    $res_fav = $conn->query("SELECT l.id_lesson, l.title, l.order_index FROM favourite_lesson f JOIN lessons l ON f.id_lesson = l.id_lesson WHERE f.id = $uid ORDER BY f.id_lesson DESC LIMIT 3");
-    if($res_fav) {
-        while($row = $res_fav->fetch_assoc()) { $fav_lessons[] = $row; }
+    // 2. Lấy danh sách Bài học yêu thích (Giới hạn gọn hoặc cuộn mượt để không đẩy dài cột phải)
+    $sql_fav = "
+        SELECT l.id_lesson, l.level, l.order_index, l.title 
+        FROM favourite_lesson f 
+        INNER JOIN lessons l ON f.id_lesson = l.id_lesson 
+        WHERE f.id = $uid 
+        ORDER BY l.level ASC, l.order_index ASC 
+        LIMIT 6
+    ";
+    $res_fav = $conn->query($sql_fav);
+    if (!$res_fav) {
+        $sql_fav_alt = "
+            SELECT l.id_lesson, l.level, l.order_index, l.title 
+            FROM favourite_lesson f 
+            INNER JOIN lessons l ON f.id_lesson = l.id_lesson 
+            WHERE f.id_user = $uid 
+            ORDER BY l.level ASC, l.order_index ASC 
+            LIMIT 6
+        ";
+        $res_fav = $conn->query($sql_fav_alt);
+    }
+    if ($res_fav && $res_fav->num_rows > 0) {
+        while ($f_row = $res_fav->fetch_assoc()) {
+            $fav_lessons[] = $f_row;
+        }
     }
 }
+
+// 3. Lấy danh sách câu hỏi cho khối "Luyện tập nhanh"
+$quick_quizzes = [];
+
+// ✅ SỬA: Dùng bảng 'exercise' (đúng tên bảng trong CSDL) + cột option_A/B/C/D (chữ HOA)
+try {
+    $q_res = $conn->query("SELECT id_ex, question, option_A, option_B, option_C, option_D, correct_option 
+                           FROM exercise 
+                           ORDER BY RAND() 
+                           LIMIT 10");
+    
+    if ($q_res && $q_res->num_rows > 0) {
+        while ($q = $q_res->fetch_assoc()) {
+            $quick_quizzes[] = [
+                'q'   => $q['question'],
+                'a'   => $q['option_A'],
+                'b'   => $q['option_B'],
+                'c'   => $q['option_C'],
+                'd'   => $q['option_D'],
+                'ans' => strtoupper(trim($q['correct_option'] ?? 'A'))
+            ];
+        }
+    }
+} catch (Throwable $e) {
+    // Nếu bảng exercise chưa có dữ liệu hoặc lỗi SQL, bỏ qua để không sập trang
+    $quick_quizzes = [];
+}
+
+if (empty($quick_quizzes)) {
+    $quick_quizzes = [
+        [
+            'q' => '物価は上がる（ ）だ。',
+            'a' => '一方',
+            'b' => 'つつ',
+            'c' => 'そう',
+            'd' => 'よう',
+            'ans' => 'A'
+        ],
+        [
+            'q' => '毎日日本語を勉強する（ ）にしています。',
+            'a' => 'こと',
+            'b' => 'よう',
+            'c' => 'もの',
+            'd' => 'ところ',
+            'ans' => 'B'
+        ],
+        [
+            'q' => '雨が降っている（ ）、出かけません。',
+            'a' => 'から',
+            'b' => 'ても',
+            'c' => 'のに',
+            'd' => 'たり',
+            'ans' => 'A'
+        ],
+        [
+            'q' => '今何時（ ）分かりますか。',
+            'a' => 'を',
+            'b' => 'が',
+            'c' => 'か',
+            'd' => 'に',
+            'ans' => 'C'
+        ],
+        [
+            'q' => '日本へ行く（ ）に、ビザをもらわなければなりません。',
+            'a' => 'あと',
+            'b' => 'まえ',
+            'c' => 'とき',
+            'd' => 'ながら',
+            'ans' => 'B'
+        ]
+    ];
+}
+$quizzes_json = json_encode($quick_quizzes, JSON_UNESCAPED_UNICODE);
 ?>
 
-<aside class="sidebar-right-wrapper" style="display: flex; flex-direction: column; gap: 20px;">
-    
-    <div class="white-card" style="margin-bottom: 0;">
-        <h3 style="color: #f39c12; margin-bottom: 15px; font-size: 16px; display: flex; align-items: center; gap: 8px;">
-            <i class="fas fa-bolt"></i> Luyện tập nhanh
-        </h3>
-        <div id="sq-content" style="min-height: 100px;">
-            </div>
-        
-        <div style="display: flex; gap: 10px; margin-top: 15px;">
-            <button onclick="loadPrevQuestion()" id="btn-prev-sq" style="flex: 1; background: #fffcf5; color: #888; border: 1px solid #ddd; padding: 8px; border-radius: 10px; font-size: 13px; font-weight: bold; cursor: pointer; transition: 0.2s;" disabled>
+<aside class="sidebar-right">
+    <!-- KHỐI 1: LUYỆN TẬP NHANH -->
+    <div class="sr-card sr-quiz-card">
+        <div class="sr-quiz-header">
+            <i class="fas fa-bolt" style="color: #f39c12;"></i>
+            <span>Luyện tập nhanh</span>
+        </div>
+
+        <div id="qz-question" class="sr-quiz-question">物価は上がる（ ）だ。</div>
+
+        <div class="sr-quiz-options" id="qz-options">
+            <button type="button" class="sr-opt-btn" data-opt="A" onclick="selectQuickOption('A')">
+                <span class="opt-letter">A.</span> <span class="opt-text" id="qz-opt-A">一方</span>
+            </button>
+            <button type="button" class="sr-opt-btn" data-opt="B" onclick="selectQuickOption('B')">
+                <span class="opt-letter">B.</span> <span class="opt-text" id="qz-opt-B">つつ</span>
+            </button>
+            <button type="button" class="sr-opt-btn" data-opt="C" onclick="selectQuickOption('C')">
+                <span class="opt-letter">C.</span> <span class="opt-text" id="qz-opt-C">そう</span>
+            </button>
+            <button type="button" class="sr-opt-btn" data-opt="D" onclick="selectQuickOption('D')">
+                <span class="opt-letter">D.</span> <span class="opt-text" id="qz-opt-D">よう</span>
+            </button>
+        </div>
+
+        <div id="qz-feedback" class="sr-quiz-feedback" style="display: none;"></div>
+
+        <div class="sr-quiz-actions">
+            <button type="button" class="sr-btn-retry" onclick="retryQuickQuiz()">
                 <i class="fas fa-undo"></i> Làm lại
             </button>
-            <button onclick="loadNextQuestion()" id="btn-next-sq" style="flex: 1; background: #fffcf5; color: #f39c12; border: 1px dashed #f39c12; padding: 8px; border-radius: 10px; font-size: 13px; font-weight: bold; cursor: pointer; transition: 0.2s;">
+            <button type="button" class="sr-btn-next" onclick="nextQuickQuiz()">
                 Câu tiếp <i class="fas fa-arrow-right"></i>
             </button>
         </div>
     </div>
 
-    <?php if (isset($_SESSION['user_id'])): ?>
-    <div class="white-card" style="margin-bottom: 0;">
-        <h3 style="color: #29e732; margin-bottom: 15px; font-size: 16px; display: flex; align-items: center; gap: 8px;">
-            <i class="fas fa-chart-pie"></i> Tiến độ học tập
-        </h3>
-        
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; font-size: 14px; font-weight: 600;">
-            <span>Cấp độ hiện tại:</span>
-            <span style="background: #fff8e1; color: #f39c12; padding: 4px 12px; border-radius: 8px;">N5</span>
+    <!-- KHỐI 2: BOX BÀI HỌC YÊU THÍCH (TỐI ƯU CHIỀU CAO CÓ THANH CUỘN MƯỢT) -->
+    <div class="sr-card sr-fav-card">
+        <div class="sr-fav-header">
+            <span><i class="fas fa-heart" style="color: #ff6b81; margin-right: 6px;"></i> Bài học yêu thích</span>
+            <?php if ($is_logged_in && count($fav_lessons) > 0): ?>
+            <a href="index.php?page=favorites" class="sr-fav-more">Xem tất cả</a>
+            <?php endif; ?>
         </div>
 
-        <div style="margin-bottom: 20px;">
-            <div style="display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 5px; font-weight: bold; color: #444;">
-                <span>Tổng tiến độ</span>
-                <span style="color: #f39c12;"><?= $total_progress ?>%</span>
-            </div>
-            <div style="width: 100%; background: #eee; height: 8px; border-radius: 10px; overflow: hidden;">
-                <div style="width: <?= $total_progress ?>%; background: #f39c12; height: 100%; border-radius: 10px;"></div>
-            </div>
+        <?php if (!$is_logged_in): ?>
+        <div class="sr-fav-empty">
+            <i class="far fa-heart"></i>
+            <p>Hãy <a href="index.php?page=login">đăng nhập</a> để lưu bài học yêu thích nhé!</p>
         </div>
+        <?php elseif (count($fav_lessons) > 0): ?>
+        <div class="sr-fav-list">
+            <?php foreach ($fav_lessons as $fav): ?>
+            <a href="index.php?page=lesson_detail&id=<?= (int)$fav['id_lesson'] ?>" class="sr-fav-item">
+                <span class="sr-fav-badge"><?= htmlspecialchars($fav['level']) ?> - Bài
+                    <?= (int)$fav['order_index'] ?></span>
+                <span class="sr-fav-title"><?= htmlspecialchars($fav['title']) ?></span>
+            </a>
+            <?php endforeach; ?>
+        </div>
+        <?php else: ?>
+        <div class="sr-fav-empty">
+            <i class="far fa-heart"></i>
+            <p>Chưa có bài học yêu thích nào.</p>
+        </div>
+        <?php endif; ?>
+    </div>
 
-        <div style="display: flex; flex-direction: column; gap: 12px; border-top: 1px solid #f5f5f5; padding-top: 15px;">
-            <div>
-                <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; color: #666; font-weight: bold;">
-                    <span><i class="fas fa-book-open" style="color: var(--pink-primary); margin-right: 5px;"></i> Bài học</span>
-                    <span><?= $percent_lesson ?>%</span>
-                </div>
-                <div style="width: 100%; background: #eee; height: 5px; border-radius: 10px;"><div style="width: <?= $percent_lesson ?>%; background: var(--pink-primary); height: 100%; border-radius: 10px;"></div></div>
-            </div>
-            <div>
-                <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; color: #666; font-weight: bold;">
-                    <span><i class="fas fa-book" style="color: #3498db; margin-right: 5px;"></i> Từ vựng</span>
-                    <span><?= $percent_vocab ?>%</span>
-                </div>
-                <div style="width: 100%; background: #eee; height: 5px; border-radius: 10px;"><div style="width: <?= $percent_vocab ?>%; background: #3498db; height: 100%; border-radius: 10px;"></div></div>
-            </div>
-            <div>
-                <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; color: #666; font-weight: bold;">
-                    <span><i class="fas fa-shapes" style="color: #9b59b6; margin-right: 5px;"></i> Ngữ pháp</span>
-                    <span><?= $percent_grammar ?>%</span>
-                </div>
-                <div style="width: 100%; background: #eee; height: 5px; border-radius: 10px;"><div style="width: <?= $percent_grammar ?>%; background: #9b59b6; height: 100%; border-radius: 10px;"></div></div>
-            </div>
+    <!-- KHỐI 3: BOX QUẢNG CÁO / GIA HẠN N3 NỔI BẬT -->
+    <?php if ($is_lifetime): ?>
+    <div class="sr-promo-box sr-promo-lifetime">
+        <div class="sr-promo-badge" style="background: #27ae60;">
+            <i class="fas fa-check-circle"></i> ĐÃ SỞ HỮU VĨNH VIỄN
+        </div>
+        <h3 class="sr-promo-title" style="color: #1e8449;">Thành Viên VIP Trọn Đời</h3>
+        <p class="sr-promo-desc">Bạn đã mở khóa toàn bộ đặc quyền khóa học N3 mãi mãi!</p>
+        <div class="sr-lifetime-tag">
+            <i class="fas fa-infinity"></i> Hạn sử dụng: Vĩnh viễn
         </div>
     </div>
 
-    <div class="white-card" style="margin-bottom: 0;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-            <h3 style="color: var(--pink-primary); font-size: 16px; margin: 0; display: flex; align-items: center; gap: 8px;">
-                <i class="fas fa-heart"></i> Bài học yêu thích
-            </h3>
-            <a href="index.php?page=favourite_lessons" style="font-size: 12px; color: #888; text-decoration: none;">Xem thêm <i class="fas fa-chevron-right" style="font-size: 10px;"></i></a>
+    <?php elseif ($is_n3_unlocked): ?>
+    <div class="sr-promo-box sr-promo-renew">
+        <div class="sr-promo-badge" style="background: linear-gradient(135deg, #f39c12, #e67e22);">
+            <i class="fas fa-gem"></i> GIA HẠN GÓI VIP N3
         </div>
-        
-        <div style="display: flex; flex-direction: column; gap: 10px;">
-            <?php if (!empty($fav_lessons)): ?>
-                <?php foreach ($fav_lessons as $fav): ?>
-                    <a href="index.php?page=hoc&id_lesson=<?= $fav['id_lesson'] ?>" style="display: flex; align-items: center; justify-content: space-between; padding: 10px; border: 1px solid #f0f0f0; border-radius: 10px; text-decoration: none; color: #444; background: #fff; transition: 0.2s;">
-                        <div style="display: flex; align-items: center; gap: 10px;">
-                            <div style="background: var(--pink-light); color: var(--pink-primary); width: 35px; height: 35px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; flex-shrink: 0;">
-                                B<?= $fav['order_index'] ?>
-                            </div>
-                            <span style="font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px;"><?= htmlspecialchars($fav['title']) ?></span>
-                        </div>
-                        <i class="fas fa-play-circle" style="color: #eee; font-size: 16px;"></i>
-                    </a>
-                <?php endforeach; ?>
-            <?php else: ?>
-                <p style="font-size: 12px; color: #999; text-align: center; padding: 10px;">Chưa có bài học yêu thích</p>
-            <?php endif; ?>
+        <h3 class="sr-promo-title">Tiếp Tục Chinh Phục N3</h3>
+        <p class="sr-promo-desc" style="margin-bottom: 6px;">
+            Hạn hiện tại: <b style="color: #d35400;"><?= $expiry_display ?></b>
+        </p>
+        <div class="sr-stack-note">
+            <i class="fas fa-calendar-plus"></i> Đăng ký trước hạn sẽ được <b>cộng dồn ngày</b>!
         </div>
+        <button type="button" onclick="goToPricingPage()" class="sr-promo-btn"
+            style="background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%); box-shadow: 0 4px 12px rgba(243, 156, 18, 0.35);">
+            <span>Gia hạn gói ngay</span>
+            <i class="fas fa-arrow-right"></i>
+        </button>
+    </div>
+
+    <?php else: ?>
+    <div class="sr-promo-box sr-promo-upgrade">
+        <div class="sr-promo-badge" style="background: linear-gradient(135deg, #ff6b81, #ff4757);">
+            <i class="fas fa-crown"></i> KHÓA N3 PREMIUM
+        </div>
+        <h3 class="sr-promo-title">Chinh Phục N3 Cấp Tốc</h3>
+        <p class="sr-promo-desc">Mở khóa trọn bộ bài giảng, từ vựng & bài tập N3 độc quyền!</p>
+        <div class="sr-price-banner">
+            <span class="sr-old-price">149.000đ</span>
+            <span class="sr-new-price">89.000đ<small>/tháng</small></span>
+        </div>
+        <button type="button" onclick="goToPricingPage()" class="sr-promo-btn"
+            style="background: linear-gradient(135deg, #ff6b81 0%, #ff4757 100%); box-shadow: 0 4px 12px rgba(255, 107, 129, 0.35);">
+            <span>Nâng cấp ngay</span>
+            <i class="fas fa-arrow-right"></i>
+        </button>
     </div>
     <?php endif; ?>
 
+    <!-- KHỐI 4: ĐỒNG HỒ ĐẾM NGƯỢC JLPT (ĐÃ TỐI ƯU KHOẢNG CÁCH KHÔNG BỊ ĐÈ) -->
+    <div class="sr-card sr-countdown-card">
+        <div class="sr-card-head">
+            <span><i class="far fa-calendar-alt" style="color: var(--pink-primary, #ff6b81); margin-right: 4px;"></i>
+                Đếm ngược JLPT</span>
+            <span class="sr-date-pill">06/12/2026</span>
+        </div>
+        <div class="sr-exam-name">Kỳ thi JLPT T12/2026</div>
+        <div class="sr-timer-grid">
+            <div class="sr-time-item">
+                <span class="sr-time-num" id="jlpt-d">30</span>
+                <span class="sr-time-lbl">NGÀY</span>
+            </div>
+            <div class="sr-time-sep">:</div>
+            <div class="sr-time-item">
+                <span class="sr-time-num" id="jlpt-h">00</span>
+                <span class="sr-time-lbl">GIỜ</span>
+            </div>
+            <div class="sr-time-sep">:</div>
+            <div class="sr-time-item">
+                <span class="sr-time-num" id="jlpt-m">00</span>
+                <span class="sr-time-lbl">PHÚT</span>
+            </div>
+            <div class="sr-time-sep">:</div>
+            <div class="sr-time-item">
+                <span class="sr-time-num" id="jlpt-s">00</span>
+                <span class="sr-time-lbl">GIÂY</span>
+            </div>
+        </div>
+        <div class="sr-card-foot">
+            <span><i class="fas fa-arrow-circle-right" style="color: #747d8c;"></i> JLPT T7/2027</span>
+            <b style="color: var(--pink-primary, #ff6b81);">Còn 241 ngày</b>
+        </div>
+    </div>
 </aside>
 
-<script>
-// --- CỜ BẢO VỆ CHỐNG NHÂN BẢN ---
-if (!window.isQuickQuizReady) {
-    window.isQuickQuizReady = true;
-
-    // Chuyển biến ra ngoài global để các hàm truy cập được an toàn
-    window.questionHistory = [];
-    window.currentIndex = -1;
-
-    window.fetchNewQuestion = function() {
-        document.getElementById('sq-content').innerHTML = '<p style="text-align:center; color:#ccc; font-size:12px; padding:20px;">Đang tải...</p>';
-        fetch('api_get_random_single.php')
-            .then(res => res.json())
-            .then(data => {
-                if(data.status === 'success') {
-                    window.questionHistory.push(data.data); 
-                    window.currentIndex = window.questionHistory.length - 1; 
-                    window.renderSQ();
-                    window.updateButtons();
-                }
-            })
-            .catch(err => {
-                 document.getElementById('sq-content').innerHTML = '<p style="text-align:center; color:#e74c3c; font-size:12px; padding:20px;">Lỗi tải câu hỏi.</p>';
-            });
-    }
-
-    window.loadNextQuestion = function() {
-        if (window.currentIndex < window.questionHistory.length - 1) {
-            window.currentIndex++;
-            window.renderSQ();
-            window.updateButtons();
-        } else {
-            window.fetchNewQuestion();
-        }
-    }
-
-    window.loadPrevQuestion = function() {
-        if (window.currentIndex > 0) {
-            window.currentIndex--;
-            window.renderSQ();
-            window.updateButtons();
-        }
-    }
-
-    window.updateButtons = function() {
-        const btnPrev = document.getElementById('btn-prev-sq');
-        if (window.currentIndex > 0) {
-            btnPrev.disabled = false;
-            btnPrev.style.color = '#e74c3c';
-            btnPrev.style.borderColor = '#e74c3c';
-        } else {
-            btnPrev.disabled = true;
-            btnPrev.style.color = '#ccc';
-            btnPrev.style.borderColor = '#ddd';
-        }
-    }
-
-    window.renderSQ = function() {
-        if(window.currentIndex < 0 || !window.questionHistory[window.currentIndex]) return;
-        let currentQ = window.questionHistory[window.currentIndex];
-        
-        let html = `
-            <p style="font-weight:700; color:#444; margin-bottom:12px; font-size:14px;">${currentQ.question}</p>
-            <div style="display:flex; flex-direction:column; gap:6px;">
-                ${['A','B','C','D'].map(opt => `
-                    <button class="sq-btn" onclick="window.checkSQ(this, '${opt}')" style="padding:8px 12px; border:1px solid #eee; border-radius:8px; background:white; cursor:pointer; font-weight:600; text-align:left; font-size:13px; transition: 0.2s;">
-                        <span style="display:inline-block; width:20px; font-weight:bold; color:#f39c12;">${opt}.</span> ${currentQ['option_'+opt]}
-                    </button>
-                `).join('')}
-            </div>`;
-        document.getElementById('sq-content').innerHTML = html;
-    }
-
-    window.checkSQ = function(btn, choice) {
-        let currentQ = window.questionHistory[window.currentIndex];
-        const btns = document.querySelectorAll('.sq-btn');
-        btns.forEach(b => b.disabled = true);
-        
-        if(choice === currentQ.correct_option) {
-            btn.style.background = '#e6ffed'; btn.style.borderColor = '#2ecc71'; btn.style.color = '#155724';
-        } else {
-            btn.style.background = '#fff5f5'; btn.style.borderColor = '#e74c3c'; btn.style.color = '#721c24';
-            btns.forEach(b => { 
-                if(b.innerText.startsWith(currentQ.correct_option)) {
-                    b.style.border = '2px dashed #2ecc71'; 
-                }
-            });
-        }
-    }
-
-    // Tự động tải câu hỏi ngay khi script chạy lần đầu
-    window.fetchNewQuestion();
+<style>
+.sidebar-right {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    /* Thu gọn khoảng cách giữa các card để vừa khít chiều cao trang chủ */
+    box-sizing: border-box;
+    position: relative;
+    z-index: 2;
 }
+
+.sr-card {
+    background: #ffffff;
+    border-radius: 18px;
+    padding: 16px;
+    box-shadow: 0 4px 15px rgba(255, 107, 129, 0.05);
+    border: 1px solid #fff0f3;
+}
+
+/* 1. CSS KHỐI LUYỆN TẬP NHANH */
+.sr-quiz-header {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13.5px;
+    font-weight: 800;
+    color: #e67e22;
+    margin-bottom: 10px;
+}
+
+.sr-quiz-question {
+    font-size: 14px;
+    font-weight: 800;
+    color: #2f3542;
+    margin-bottom: 10px;
+    line-height: 1.4;
+}
+
+.sr-quiz-options {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin-bottom: 10px;
+}
+
+.sr-opt-btn {
+    width: 100%;
+    text-align: left;
+    background: #ffffff;
+    border: 1px solid #eee;
+    border-radius: 9px;
+    padding: 8px 12px;
+    font-size: 13px;
+    color: #2f3542;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.sr-opt-btn:hover:not(:disabled) {
+    border-color: #f39c12;
+    background: #fffdf9;
+}
+
+.sr-opt-btn .opt-letter {
+    color: #f39c12;
+    font-weight: 800;
+}
+
+.sr-opt-btn .opt-text {
+    font-weight: 700;
+    color: #2f3542;
+}
+
+.sr-opt-btn.correct {
+    background: #eafaf1 !important;
+    border-color: #2ecc71 !important;
+    color: #27ae60 !important;
+}
+
+.sr-opt-btn.wrong {
+    background: #fff5f5 !important;
+    border-color: #e74c3c !important;
+    color: #c0392b !important;
+}
+
+.sr-quiz-feedback {
+    font-size: 11.5px;
+    font-weight: 700;
+    padding: 6px 10px;
+    border-radius: 8px;
+    margin-bottom: 10px;
+    text-align: center;
+}
+
+.sr-quiz-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.sr-btn-retry {
+    background: #f8f9fa;
+    border: 1px solid #e0e0e0;
+    color: #747d8c;
+    border-radius: 9px;
+    padding: 8px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: 0.2s;
+}
+
+.sr-btn-retry:hover {
+    background: #eef1f5;
+    color: #2f3542;
+}
+
+.sr-btn-next {
+    background: #fff9eb;
+    border: 1px solid #f9ca24;
+    color: #e67e22;
+    border-radius: 9px;
+    padding: 8px;
+    font-size: 12px;
+    font-weight: 800;
+    cursor: pointer;
+    transition: 0.2s;
+}
+
+.sr-btn-next:hover {
+    background: #f39c12;
+    color: #ffffff;
+}
+
+/* 2. CSS KHỐI BÀI HỌC YÊU THÍCH (GIỚI HẠN CHIỀU CAO ĐỂ KHÔNG ĐẨY TRÀN ĐỒNG HỒ) */
+.sr-fav-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13.5px;
+    font-weight: 800;
+    color: #2f3542;
+    margin-bottom: 10px;
+}
+
+.sr-fav-more {
+    font-size: 11px;
+    color: var(--pink-primary, #ff6b81);
+    text-decoration: none;
+    font-weight: 700;
+}
+
+.sr-fav-more:hover {
+    text-decoration: underline;
+}
+
+.sr-fav-list {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    max-height: 125px;
+    /* Hiển thị vừa vặn 2 bài và cho phép cuộn mượt nếu có nhiều bài hơn */
+    overflow-y: auto;
+    padding-right: 3px;
+}
+
+.sr-fav-list::-webkit-scrollbar {
+    width: 4px;
+}
+
+.sr-fav-list::-webkit-scrollbar-thumb {
+    background: #ffccd5;
+    border-radius: 10px;
+}
+
+.sr-fav-item {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 8px 11px;
+    border-radius: 10px;
+    background: #fff9fa;
+    border: 1px solid #ffeef1;
+    text-decoration: none;
+    transition: all 0.2s ease;
+}
+
+.sr-fav-item:hover {
+    background: #fff0f3;
+    border-color: #ffccd5;
+}
+
+.sr-fav-badge {
+    align-self: flex-start;
+    background: var(--pink-primary, #ff6b81);
+    color: #ffffff;
+    font-size: 9.5px;
+    font-weight: 800;
+    padding: 2px 7px;
+    border-radius: 5px;
+}
+
+.sr-fav-title {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: #2f3542;
+    line-height: 1.3;
+}
+
+.sr-fav-empty {
+    text-align: center;
+    padding: 12px 8px;
+    background: #fcfcfc;
+    border: 1px dashed #ffd8e0;
+    border-radius: 10px;
+}
+
+.sr-fav-empty i {
+    font-size: 20px;
+    color: #ffb8c6;
+    margin-bottom: 5px;
+    display: block;
+}
+
+.sr-fav-empty p {
+    margin: 0;
+    font-size: 11.5px;
+    color: #747d8c;
+    line-height: 1.4;
+}
+
+.sr-fav-empty a {
+    color: var(--pink-primary, #ff6b81);
+    font-weight: 800;
+    text-decoration: none;
+}
+
+/* 3. CSS BOX QUẢNG CÁO N3 GỌN GÀNG NỔI BẬT */
+.sr-promo-box {
+    border-radius: 18px;
+    padding: 15px 15px;
+    text-align: center;
+    position: relative;
+    transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
+
+.sr-promo-box:hover {
+    transform: translateY(-2px);
+}
+
+.sr-promo-upgrade {
+    background: linear-gradient(180deg, #ffffff 0%, #fff0f4 100%);
+    border: 2px solid #ffccd5;
+    box-shadow: 0 6px 18px rgba(255, 107, 129, 0.12);
+}
+
+.sr-promo-renew {
+    background: linear-gradient(180deg, #ffffff 0%, #fff9eb 100%);
+    border: 2px solid #fde3a7;
+    box-shadow: 0 6px 18px rgba(243, 156, 18, 0.12);
+}
+
+.sr-promo-lifetime {
+    background: linear-gradient(180deg, #ffffff 0%, #eafaf1 100%);
+    border: 2px solid #a9dfbf;
+    box-shadow: 0 6px 18px rgba(46, 204, 113, 0.12);
+}
+
+.sr-promo-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: #fff;
+    font-size: 10.5px;
+    font-weight: 800;
+    padding: 4px 12px;
+    border-radius: 20px;
+    margin-bottom: 8px;
+}
+
+.sr-promo-title {
+    font-size: 15px;
+    font-weight: 800;
+    color: #2f3542;
+    margin: 0 0 5px 0;
+}
+
+.sr-promo-desc {
+    font-size: 12px;
+    color: #57606f;
+    line-height: 1.4;
+    margin: 0 0 10px 0;
+}
+
+.sr-price-banner {
+    background: #ffffff;
+    border: 1.5px dashed #ffa8b6;
+    border-radius: 10px;
+    padding: 5px 8px;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 8px;
+}
+
+.sr-old-price {
+    text-decoration: line-through;
+    color: #a4b0be;
+    font-size: 11.5px;
+}
+
+.sr-new-price {
+    color: var(--pink-primary, #ff6b81);
+    font-size: 18px;
+    font-weight: 900;
+}
+
+.sr-new-price small {
+    font-size: 10.5px;
+    color: #747d8c;
+    font-weight: 600;
+}
+
+.sr-stack-note {
+    background: #fff3cd;
+    color: #856404;
+    border: 1px dashed #ffeeba;
+    padding: 5px 8px;
+    border-radius: 8px;
+    font-size: 11px;
+    margin-bottom: 10px;
+}
+
+.sr-lifetime-tag {
+    background: #d4efdf;
+    color: #1e8449;
+    font-weight: 800;
+    font-size: 11.5px;
+    padding: 6px 10px;
+    border-radius: 8px;
+}
+
+.sr-promo-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    width: 100%;
+    padding: 10px;
+    border: none;
+    border-radius: 10px;
+    color: #ffffff !important;
+    font-weight: 800;
+    font-size: 12.5px;
+    font-family: inherit;
+    cursor: pointer;
+    box-sizing: border-box;
+    transition: all 0.2s ease;
+}
+
+.sr-promo-btn:hover {
+    filter: brightness(1.06);
+    transform: translateY(-1px);
+}
+
+/* 4. CSS ĐỒNG HỒ ĐẾM NGƯỢC */
+.sr-countdown-card {
+    padding: 14px 16px;
+}
+
+.sr-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11.5px;
+    font-weight: 700;
+    color: #747d8c;
+    margin-bottom: 8px;
+}
+
+.sr-date-pill {
+    background: #fff0f3;
+    color: var(--pink-primary, #ff6b81);
+    padding: 2px 7px;
+    border-radius: 7px;
+    font-size: 10.5px;
+    font-weight: 800;
+}
+
+.sr-exam-name {
+    text-align: center;
+    font-size: 13px;
+    font-weight: 800;
+    color: #2f3542;
+    margin-bottom: 8px;
+}
+
+.sr-timer-grid {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 5px;
+    background: #fff8f9;
+    padding: 8px 6px;
+    border-radius: 10px;
+    border: 1px solid #ffe6ea;
+    margin-bottom: 8px;
+}
+
+.sr-time-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 34px;
+}
+
+.sr-time-num {
+    font-size: 16px;
+    font-weight: 900;
+    color: var(--pink-primary, #ff6b81);
+    line-height: 1.1;
+}
+
+.sr-time-lbl {
+    font-size: 8px;
+    font-weight: 800;
+    color: #a4b0be;
+    margin-top: 2px;
+}
+
+.sr-time-sep {
+    font-size: 14px;
+    font-weight: 800;
+    color: #ffccd5;
+    margin-top: -6px;
+}
+
+.sr-card-foot {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10.5px;
+    color: #747d8c;
+    border-top: 1px dashed #eee;
+    padding-top: 8px;
+}
+</style>
+
+<script>
+// ĐIỀU HƯỚNG SANG TRANG BẢNG GIÁ AN TOÀN
+function goToPricingPage() {
+    if (typeof loadPage === 'function') {
+        loadPage('pricing');
+    } else {
+        window.location.href = 'index.php?page=pricing';
+    }
+}
+
+// 1. LOGIC LUYỆN TẬP NHANH
+const quickQuizList = <?= $quizzes_json ?>;
+let currentQuizIdx = 0;
+
+function renderQuickQuiz() {
+    if (!quickQuizList || quickQuizList.length === 0) return;
+    const item = quickQuizList[currentQuizIdx];
+    const qEl = document.getElementById('qz-question');
+    const fbEl = document.getElementById('qz-feedback');
+    if (!qEl) return;
+
+    qEl.textContent = item.q;
+    document.getElementById('qz-opt-A').textContent = item.a;
+    document.getElementById('qz-opt-B').textContent = item.b;
+    document.getElementById('qz-opt-C').textContent = item.c;
+    document.getElementById('qz-opt-D').textContent = item.d;
+
+    if (fbEl) fbEl.style.display = 'none';
+
+    const buttons = document.querySelectorAll('#qz-options .sr-opt-btn');
+    buttons.forEach(btn => {
+        btn.disabled = false;
+        btn.classList.remove('correct', 'wrong');
+    });
+}
+
+function selectQuickOption(chosen) {
+    const item = quickQuizList[currentQuizIdx];
+    const correctAns = (item.ans || 'A').toUpperCase();
+    const buttons = document.querySelectorAll('#qz-options .sr-opt-btn');
+    const fbEl = document.getElementById('qz-feedback');
+
+    buttons.forEach(btn => {
+        const opt = btn.getAttribute('data-opt');
+        btn.disabled = true;
+        if (opt === correctAns) {
+            btn.classList.add('correct');
+        } else if (opt === chosen && chosen !== correctAns) {
+            btn.classList.add('wrong');
+        }
+    });
+
+    if (fbEl) {
+        fbEl.style.display = 'block';
+        if (chosen === correctAns) {
+            fbEl.style.background = '#eafaf1';
+            fbEl.style.color = '#27ae60';
+            fbEl.innerHTML = '🎉 Chính xác! Đáp án đúng là <b>' + correctAns + '</b>.';
+        } else {
+            fbEl.style.background = '#fff5f5';
+            fbEl.style.color = '#e74c3c';
+            fbEl.innerHTML = '💡 Chưa đúng! Đáp án đúng là <b>' + correctAns + '</b>.';
+        }
+    }
+}
+
+function retryQuickQuiz() {
+    renderQuickQuiz();
+}
+
+function nextQuickQuiz() {
+    currentQuizIdx = (currentQuizIdx + 1) % quickQuizList.length;
+    renderQuickQuiz();
+}
+
+renderQuickQuiz();
+
+// 2. LOGIC ĐỒNG HỒ ĐẾM NGƯỢC JLPT
+(function initJlptCountdown() {
+    const targetTime = new Date("2026-12-06T08:00:00+07:00").getTime();
+
+    function updateClock() {
+        const dEl = document.getElementById('jlpt-d');
+        const hEl = document.getElementById('jlpt-h');
+        const mEl = document.getElementById('jlpt-m');
+        const sEl = document.getElementById('jlpt-s');
+        if (!dEl || !hEl || !mEl || !sEl) return;
+
+        const now = new Date().getTime();
+        const diff = Math.max(0, targetTime - now);
+
+        const d = Math.floor(diff / (1000 * 60 * 60 * 24));
+        const h = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        const m = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+        const s = Math.floor((diff % (1000 * 60)) / 1000);
+
+        dEl.textContent = String(d).padStart(2, '0');
+        hEl.textContent = String(h).padStart(2, '0');
+        mEl.textContent = String(m).padStart(2, '0');
+        sEl.textContent = String(s).padStart(2, '0');
+    }
+    updateClock();
+    setInterval(updateClock, 1000);
+})();
 </script>

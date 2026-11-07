@@ -83,21 +83,49 @@
         </tbody>
     </table>
 
-    <?php if ($total_pages > 1): ?>
-    <div class="pagination">
-        <?php if ($p > 1): ?>
-            <a href="index.php?page=vocab&level=<?= $current_level ?>&p=<?= $p - 1 ?>" class="page-link"><i class="fas fa-chevron-left"></i></a>
-        <?php endif; ?>
-
-        <?php for ($i = 1; $i <= $total_pages; $i++): ?>
-            <a href="index.php?page=vocab&level=<?= $current_level ?>&p=<?= $i ?>" class="page-link <?= ($i == $p) ? 'active' : '' ?>"><?= $i ?></a>
-        <?php endfor; ?>
-
-        <?php if ($p < $total_pages): ?>
-            <a href="index.php?page=vocab&level=<?= $current_level ?>&p=<?= $p + 1 ?>" class="page-link"><i class="fas fa-chevron-right"></i></a>
-        <?php endif; ?>
-    </div>
+   <!-- ✅ PHÂN TRANG AN TOÀN - KHÔNG LỖI FONT -->
+<?php if ($total_pages > 1): ?>
+<div class="pagination">
+    
+    <!-- Nút Trang trước -->
+    <?php if ($p > 1): ?>
+        <a href="index.php?page=vocab&level=<?= $current_level ?>&p=<?= $p - 1 ?>" class="page-link" title="Trang truoc">
+            &laquo; Prev
+        </a>
     <?php endif; ?>
+
+    <?php 
+    $start = max(1, $p - 3);
+    $end = min($total_pages, $p + 3);
+    
+    // Nút trang đầu
+    if ($start > 1) {
+        echo "<a href='index.php?page=vocab&level=$current_level&p=1' class='page-link'>1</a>";
+        if ($start > 2) echo "<span style='padding: 8px;'>...</span>";
+    }
+    
+    // Các trang ở giữa
+    for ($i = $start; $i <= $end; $i++): 
+    ?>
+        <a href="index.php?page=vocab&level=<?= $current_level ?>&p=<?= $i ?>" class="page-link <?= ($i == $p) ? 'active' : '' ?>"><?= $i ?></a>
+    <?php endfor; 
+    
+    // Nút trang cuối
+    if ($end < $total_pages) {
+        if ($end < $total_pages - 1) echo "<span style='padding: 8px;'>...</span>";
+        echo "<a href='index.php?page=vocab&level=$current_level&p=$total_pages' class='page-link'>$total_pages</a>";
+    }
+    ?>
+
+    <!-- Nút Trang sau -->
+    <?php if ($p < $total_pages): ?>
+        <a href="index.php?page=vocab&level=<?= $current_level ?>&p=<?= $p + 1 ?>" class="page-link" title="Trang sau">
+            Next &raquo;
+        </a>
+    <?php endif; ?>
+    
+</div>
+<?php endif; ?>
 </div>
 
 <script>
